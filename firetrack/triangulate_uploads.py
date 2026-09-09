@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from .ekf import ekf_smooth_trajectory
+from .sources import tracking_result_path
 from .triangulate_527 import (
     Observation,
     interpolate_centroid,
@@ -202,8 +203,8 @@ def _scaled_K(K: np.ndarray, resolution, width: int, height: int) -> np.ndarray:
     return out
 
 
-def _load_camera(spec: dict, detections_root: Path) -> UploadCamera:
-    cen_path = detections_root / UPLOAD_SUBDIR / spec["video"] / "centroids.npz"
+def _load_camera(spec: dict, detections_root: Path, *, detections_subdir: str = UPLOAD_SUBDIR) -> UploadCamera:
+    cen_path = detections_root / detections_subdir / spec["video"] / "centroids.npz"
     with np.load(cen_path) as z:
         centroids = np.array(z["centroids"], dtype=np.float64)
         fps = float(z["fps"])
@@ -226,8 +227,8 @@ def _load_camera(spec: dict, detections_root: Path) -> UploadCamera:
     )
 
 
-def _detected_labels(detections_root: Path) -> set[str]:
-    base = detections_root / UPLOAD_SUBDIR
+def _detected_labels(detections_root: Path, *, detections_subdir: str = UPLOAD_SUBDIR) -> set[str]:
+    base = detections_root / detections_subdir
     return {p.parent.name for p in base.glob("*/centroids.npz")} if base.exists() else set()
 
 
@@ -237,16 +238,40 @@ def _uploaded_labels(uploads_root: Path | None) -> set[str] | None:
     return {p.name for p in uploads_root.iterdir() if p.is_dir()}
 
 
+def _with_upload_metadata(spec: dict, uploads_root: Path | None) -> dict:
+    if uploads_root is None:
+        return spec
+    metadata = uploads_root / spec["video"] / "metadata.json"
+    if not metadata.exists():
+        return spec
+    try:
+        data = json.loads(metadata.read_text())
+        if "startTime" not in data:
+            return spec
+        out = dict(spec)
+        time_offset_s = 0.0
+        source = spec.get("source")
+        if isinstance(source, dict) and isinstance(source.get("time_offset_s"), (int, float)):
+            time_offset_s = float(source["time_offset_s"])
+        out["start_epoch_s"] = float(data["startTime"]) * 1e-6 + time_offset_s
+        return out
+    except (OSError, ValueError, json.JSONDecodeError):
+        return spec
+
+
 def triangulate_uploads(
     *,
     detections_root: Path,
     calibration_json: Path,
     out_root: Path,
     uploads_root: Path | None = None,
+    detections_subdir: str = UPLOAD_SUBDIR,
+    output_subdir: str = UPLOAD_SUBDIR,
     max_reproj_px: float = 30.0,
 ) -> dict:
-    specs = validate_calibration(json.loads(Path(calibration_json).read_text()))
-    detected = _detected_labels(detections_root)
+    calibration_document = json.loads(Path(calibration_json).read_text())
+    specs = validate_calibration(calibration_document)
+    detected = _detected_labels(detections_root, detections_subdir=detections_subdir)
     uploaded = _uploaded_labels(uploads_root)
 
     cameras: list[UploadCamera] = []
@@ -254,7 +279,11 @@ def triangulate_uploads(
     for spec in specs:
         name = spec["video"]
         if name in detected:
-            cameras.append(_load_camera(spec, detections_root))
+            cameras.append(_load_camera(
+                _with_upload_metadata(spec, uploads_root),
+                detections_root,
+                detections_subdir=detections_subdir,
+            ))
         elif uploaded is not None and name not in uploaded:
             avail = ", ".join(sorted(uploaded)) or "no clips uploaded"
             print(f"  [{name}] no uploaded clip with this name. Available: {avail}")
@@ -300,7 +329,7 @@ def triangulate_uploads(
     smooth = ekf_smooth_trajectory(trajectory, sim_times=times, n_views=n_views, reproj_errors=reproj)
     gt = np.full((n, 3), np.nan, dtype=np.float64)  # no mocap ground truth
 
-    out_dir = out_root / UPLOAD_SUBDIR
+    out_dir = out_root / output_subdir
     out_dir.mkdir(parents=True, exist_ok=True)
     np.savez(
         out_dir / "trajectory.npz",
@@ -315,17 +344,22 @@ def triangulate_uploads(
     )
     write_csv(out_dir / "trajectory.csv", times, n_views, reproj, used, trajectory, smooth, gt)
     summary = {
-        "run": "uploads",
+        "run": tracking_result_path(output_subdir),
         "source": "uploaded calibration (no mocap; no ground-truth metrics)",
         "n_frames": int(n),
         "reference_camera": ref.name,
         "cameras": [c.name for c in cameras],
         "skipped_cameras": skipped,
         "camera_start_epochs_s": {c.name: c.start_epoch_s for c in cameras},
+        "calibration_snapshot": {
+            **{key: calibration_document[key] for key in ("world_frame", "frame", "calibration_clock")
+               if key in calibration_document},
+            "cameras": specs,
+        },
         "n_raw_triangulated": int(np.isfinite(trajectory[:, 0]).sum()),
         "n_smooth_finite": int(np.isfinite(smooth[:, 0]).sum()),
         "median_reproj_px": float(np.nanmedian(reproj)) if np.isfinite(reproj).any() else None,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
-    print(f"  uploads: {summary['n_raw_triangulated']}/{n} frames from {len(cameras)} cameras")
+    print(f"  {tracking_result_path(output_subdir)}: {summary['n_raw_triangulated']}/{n} frames from {len(cameras)} cameras")
     return summary

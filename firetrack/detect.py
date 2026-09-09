@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -121,6 +122,18 @@ def build_predictor():
     return build_sam3_video_predictor(**kwargs)
 
 
+def release_cuda_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
 def extract_mask(outputs: dict, *, use_click: bool) -> np.ndarray | None:
     if not outputs:
         return None
@@ -217,6 +230,7 @@ def run_sam3_on_video(
 
     paths = output_paths(spec, out_root)
     if not overwrite and outputs_complete(paths, save_masks=save_masks):
+        print(f"  [{spec.label}] skip: existing detection outputs")
         summary = json.loads(paths.summary_path.read_text())
         return DetectionResult(
             spec,
@@ -308,8 +322,7 @@ def run_sam3_on_video(
     finally:
         if owns_predictor:
             del predictor
-            gc.collect()
-        torch.cuda.empty_cache()
+        release_cuda_memory()
 
     result = save_detection_outputs(
         spec,
@@ -337,35 +350,53 @@ def run_detection_on_specs(
     overwrite: bool = False,
     on_progress: Any = None,
 ) -> list[DetectionResult]:
+    if not specs:
+        raise RuntimeError("No videos found for detection. Upload and format clips first.")
     clicks = load_clicks(clicks_json) if clicks_json is not None else {}
-    predictor = build_predictor()
     results: list[DetectionResult] = []
     n_videos = len(specs)
+    reuse_predictor = os.environ.get("FIRETRACK_REUSE_SAM_PREDICTOR") == "1"
+    predictor = build_predictor() if reuse_predictor else None
     try:
-        for index, spec in enumerate(specs):
-            click = clicks.get(spec.label)
-            if clicks_json is not None and click is None:
-                print(f"  [{spec.label}] skip: no approved click")
-                continue
-            spec_progress = None
-            if on_progress is not None:
-                def spec_progress(p, _i=index):
-                    on_progress({**p, "video": _i + 1, "n_videos": n_videos, "stage": "detect"})
-            results.append(
-                run_sam3_on_video(
-                    spec,
-                    out_root,
-                    text_prompt=text_prompt,
-                    save_masks=save_masks,
-                    overwrite=overwrite,
-                    click=click,
-                    predictor=predictor,
-                    on_progress=spec_progress,
+        try:
+            for index, spec in enumerate(specs):
+                click = clicks.get(spec.label)
+                if clicks_json is not None and click is None:
+                    print(f"  [{spec.label}] skip: no approved click")
+                    continue
+                spec_progress = None
+                if on_progress is not None:
+                    def spec_progress(p, _i=index):
+                        on_progress({**p, "video": _i + 1, "n_videos": n_videos, "stage": "detect"})
+                results.append(
+                    run_sam3_on_video(
+                        spec,
+                        out_root,
+                        text_prompt=text_prompt,
+                        save_masks=save_masks,
+                        overwrite=overwrite,
+                        click=click,
+                        predictor=predictor,
+                        on_progress=spec_progress,
+                    )
                 )
-            )
-    finally:
-        del predictor
-        gc.collect()
+                if not reuse_predictor:
+                    release_cuda_memory()
+        finally:
+            if predictor is not None:
+                del predictor
+            release_cuda_memory()
+    except RuntimeError as exc:
+        if "out of memory" in str(exc).lower():
+            release_cuda_memory()
+            raise RuntimeError(
+                "CUDA out of memory while running SAM detection. Stop other GPU jobs or restart the "
+                "webapp process, then rerun Detect. The no-mocap path keeps native frames, so no "
+                "calibration data is harmed by rerunning detection."
+            ) from exc
+        raise
+    if not results:
+        raise RuntimeError("No videos were detected. Check that selected clips have approved annotation clicks.")
     return results
 
 

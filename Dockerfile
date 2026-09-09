@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     HF_HOME=/work/.cache/huggingface \
+    FIRETRACK_CLASSIFIER_CACHE=/opt/firetrack/classifier-cache \
     FIRETRACK_FFMPEG=/usr/bin/ffmpeg
 
 WORKDIR /app
@@ -23,10 +24,15 @@ RUN apt-get update \
 COPY requirements.txt pyproject.toml README.md ./
 COPY firetrack ./firetrack
 COPY vendor ./vendor
+COPY scripts ./scripts
 
 RUN python -m pip install --upgrade pip \
     && python -m pip install -r requirements.txt \
     && python -m pip install --no-deps .
+
+# The CPU classifier is under 1 MB. Cache its pinned, checksummed checkpoint in
+# the image so web startup is deterministic and does not require network access.
+RUN python scripts/prepare_classifier.py
 
 # The app packages the SAM3 BPE vocab under vendor/sam3_assets and passes it to
 # SAM3 explicitly. Keep this compatibility copy too because sam3==0.1.2 also

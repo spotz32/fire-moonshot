@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Sequence
 
+from .calibrate_logs import calibrate_from_log, summarize_log_and_run
+from .calibrate_mocap import export_mocap_calibration
 from .clicks import click_status, serve_click_ui
 from .detect import run_detection
 from .format_527 import normalize_dataset
@@ -80,6 +82,47 @@ def _cmd_triangulate(args: argparse.Namespace) -> int:
         calibrate_only=args.calibrate_only,
         calibration_json=args.calibration_json,
     )
+    return 0
+
+
+def _cmd_log_summary(args: argparse.Namespace) -> int:
+    summary = summarize_log_and_run(args.log, args.run_root)
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_calibrate_from_log(args: argparse.Namespace) -> int:
+    result = calibrate_from_log(
+        log_path=args.log,
+        run_root=args.run_root,
+        detections_root=args.detections_root,
+        out_json=args.out_json,
+        sample_count=args.sample_count,
+        ransac_reproj_px=args.ransac_reproj_px,
+        time_offset_s=args.time_offset_s,
+        clock_lag_s=args.clock_lag_s,
+        offset_search_radius_s=args.offset_search_radius_s,
+        offset_search_step_s=args.offset_search_step_s,
+        smoothing_m=args.smoothing_m,
+        huber_px=args.huber_px,
+        focal_sigma=args.focal_sigma,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_calibrate_from_mocap(args: argparse.Namespace) -> int:
+    result = export_mocap_calibration(
+        raw_root=args.raw_root,
+        formatted_root=args.formatted_root,
+        detections_root=args.detections_root,
+        out_json=args.out_json,
+        run=args.run,
+        sample_count=args.sample_count,
+        ransac_reproj_px=args.ransac_reproj_px,
+        label_map=args.label_map,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
 
@@ -178,6 +221,43 @@ def build_parser() -> argparse.ArgumentParser:
     tri.add_argument("--calibrate-only", action="store_true", help="Only estimate and save calibration.")
     tri.add_argument("--calibration-json", type=_path, help="Calibration JSON to read or write.")
     tri.set_defaults(func=_cmd_triangulate)
+
+    log_summary = subparsers.add_parser("log-summary", help="Show ArduPilot log/camera-run timestamp overlap.")
+    log_summary.add_argument("--log", required=True, type=_path, help="ArduPilot DataFlash .BIN log.")
+    log_summary.add_argument("--run-root", required=True, type=_path, help="Camera run root with cam*/metadata.json.")
+    log_summary.set_defaults(func=_cmd_log_summary)
+
+    calib_log = subparsers.add_parser("calibrate-from-log", help="Estimate upload-mode camera extrinsics from a flight log.")
+    calib_log.add_argument("--log", required=True, type=_path, help="ArduPilot DataFlash .BIN log.")
+    calib_log.add_argument("--run-root", required=True, type=_path, help="Calibration camera run root with cam*/camera.json.")
+    calib_log.add_argument("--detections-root", required=True, type=_path, help="Detection output root containing centroids.npz files.")
+    calib_log.add_argument("--out-json", required=True, type=_path, help="Calibration JSON to write for upload triangulation.")
+    calib_log.add_argument("--sample-count", default=600, type=int, help="Maximum detections per camera, including held-out validation.")
+    calib_log.add_argument("--ransac-reproj-px", default=8.0, type=float, help="PnP RANSAC reprojection threshold.")
+    calib_log.add_argument("--clock-lag-s", default=0.22, type=float, help="Initial shared camera_time - log_time lag in seconds.")
+    calib_log.add_argument("--time-offset-s", default=None, type=float, help=argparse.SUPPRESS)
+    calib_log.add_argument("--offset-search-radius-s", default=2.0, type=float, help="Shared-lag bounds +/- this many seconds around --clock-lag-s; zero fixes timing.")
+    calib_log.add_argument("--offset-search-step-s", default=0.25, type=float, help="Maximum spacing between PnP initialization offsets; refinement is continuous.")
+    calib_log.add_argument("--smoothing-m", default=0.1, type=float, help="Per-axis spline RMS smoothing allowance in meters; zero interpolates log positions.")
+    calib_log.add_argument("--huber-px", default=3.0, type=float, help="Huber transition in pixels for each 2D detection residual.")
+    calib_log.add_argument("--focal-sigma", default=float("inf"), type=float, help="0 fixes common fx=fy; inf estimates one common focal length per camera; e.g. 0.02 gives it a 2%% prior.")
+    calib_log.set_defaults(func=_cmd_calibrate_from_log)
+
+    calib_mocap = subparsers.add_parser("calibrate-from-mocap", help="Export upload-mode camera calibration from a mocap run.")
+    calib_mocap.add_argument("--raw-root", required=True, type=_path, help="Raw 5-27 dataset root with mocap TSVs.")
+    calib_mocap.add_argument("--formatted-root", required=True, type=_path, help="Normalized video root.")
+    calib_mocap.add_argument("--detections-root", required=True, type=_path, help="Detection output root containing centroids.npz files.")
+    calib_mocap.add_argument("--out-json", required=True, type=_path, help="Upload-mode calibration JSON to write.")
+    calib_mocap.add_argument("--run", required=True, help="Mocap run name to calibrate from, e.g. ardu_run1.")
+    calib_mocap.add_argument("--sample-count", default=160, type=int, help="Maximum correspondences per camera.")
+    calib_mocap.add_argument("--ransac-reproj-px", default=8.0, type=float, help="PnP RANSAC reprojection threshold.")
+    calib_mocap.add_argument(
+        "--label-map",
+        action="append",
+        default=None,
+        help="Map formatted/source labels to upload labels, e.g. camera1=cam1. May be repeated.",
+    )
+    calib_mocap.set_defaults(func=_cmd_calibrate_from_mocap)
 
     run_all = subparsers.add_parser("run-all", help="Run format, detect, and triangulate in sequence.")
     run_all.add_argument("--raw-root", required=True, type=_path, help="Raw 5-27 dataset root.")

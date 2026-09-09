@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from .ekf import ekf_smooth_trajectory
+from .dataset_527 import discover_cameras
 from .mocap import MocapRun6D, load_mocap_6d
 
 RUNS = [
@@ -151,6 +152,36 @@ def make_session(formatted_root: Path, detections_root: Path, run: str, phone: s
         label=label,
         phone=phone,
         session_dir=session_dir,
+        centroids_path=centroids_path,
+        centroids=centroids,
+        fps=fps,
+        width=width,
+        height=height,
+        video_start_epoch_s=float(metadata["startTime"]) * 1e-6,
+        intrinsics=intrinsics,
+    )
+
+
+def make_raw_session(raw_root: Path, detections_root: Path, run: str, phone: str) -> SessionData:
+    """Build a mocap session directly from raw uploaded videos."""
+    matches = [cam for cam in discover_cameras(raw_root) if cam.run == run and cam.phone == phone]
+    if len(matches) != 1:
+        raise RuntimeError(f"{run}/{phone}: expected 1 raw camera, found {len(matches)}")
+    cam = matches[0]
+    centroids_path = detections_root / "mocap_raw" / cam.relative_dir / "centroids.npz"
+    with np.load(centroids_path) as z:
+        centroids = np.array(z["centroids"], dtype=np.float64)
+        fps = float(z["fps"])
+        width = int(z["width"])
+        height = int(z["height"])
+        label = str(z["label"])
+    metadata = json.loads((cam.camera_dir / "metadata.json").read_text())
+    raw_calib = json.loads((cam.camera_dir / "calibration.json").read_text())
+    intrinsics = scaled_intrinsics(raw_calib, target_width=width, target_height=height)
+    return SessionData(
+        label=label,
+        phone=phone,
+        session_dir=cam.camera_dir,
         centroids_path=centroids_path,
         centroids=centroids,
         fps=fps,
@@ -356,6 +387,52 @@ def calibrate(
     return calib
 
 
+def calibrate_raw(
+    *,
+    raw_root: Path,
+    detections_root: Path,
+    ransac_px: float = 8.0,
+    sample: int = 80,
+    needed_configs: set[tuple[str, str]] | None = None,
+) -> dict[tuple[str, str], CamCalib]:
+    calib: dict[tuple[str, str], CamCalib] = {}
+    print("=== Calibrating raw-video extrinsics ===")
+    items = CALIB_RUN.items()
+    if needed_configs is not None:
+        items = [(key, run) for key, run in items if key in needed_configs]
+    for (phone, config), run in items:
+        mocap = load_mocap_6d(mocap_path(raw_root, run))
+        session = make_raw_session(raw_root, detections_root, run, phone)
+        offset, _, fit = find_calibration_time_offset(
+            session,
+            mocap,
+            sample_count=sample,
+            radius_s=5.0,
+            coarse_step_s=0.1,
+            fine_step_s=0.01,
+            ransac_reproj_px=ransac_px,
+        )
+        center = camera_center_world(fit.rvec, fit.tvec)
+        bodies = {b: finite_body_center(mocap, b) for b in MOCAP_BODY.values()}
+        nearest = min((b for b, c in bodies.items() if c is not None), key=lambda b: float(np.linalg.norm(center - bodies[b])))
+        med = float(np.median(fit.errors_px))
+        flag = "" if nearest == MOCAP_BODY[phone] else f" nearest={nearest}"
+        print(f"  {phone:10s} [{config:4s}] raw calib={run:12s} reproj_med={med:5.2f}px dt={offset:+.2f}s{flag}")
+        calib[(phone, config)] = CamCalib(
+            phone,
+            config,
+            MOCAP_BODY[phone],
+            run,
+            session.intrinsics.K,
+            session.intrinsics.dist_coeffs,
+            fit.rvec,
+            fit.tvec,
+            offset,
+            med,
+        )
+    return calib
+
+
 def save_calibration(calib: dict[tuple[str, str], CamCalib], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     out = {}
@@ -542,6 +619,33 @@ def build_camera(run: str, phone: str, calib: dict[tuple[str, str], CamCalib], m
     }
 
 
+def build_raw_camera(run: str, phone: str, calib: dict[tuple[str, str], CamCalib], mocap: MocapRun6D, raw_root: Path, detections_root: Path) -> dict:
+    config = config_for(run, phone)
+    c = calib[(phone, config)]
+    session = make_raw_session(raw_root, detections_root, run, phone)
+    offset, med, n = sync_time_offset(session, mocap, c.rvec, c.tvec, nominal_s=c.nominal_offset_s)
+    R, _ = cv2.Rodrigues(c.rvec)
+    P = c.K @ np.hstack([R, c.tvec.reshape(3, 1)])
+    return {
+        "phone": phone,
+        "label": session.label,
+        "config": config,
+        "K": c.K,
+        "dist": c.dist_coeffs,
+        "rvec": c.rvec,
+        "tvec": c.tvec,
+        "R": R,
+        "P": P,
+        "centroids": session.centroids,
+        "fps": session.fps,
+        "start_epoch": session.video_start_epoch_s,
+        "offset": offset,
+        "aligned_start": session.video_start_epoch_s + offset,
+        "sync_med_px": med,
+        "sync_n": n,
+    }
+
+
 def score_trajectory(trajectory: np.ndarray, gt: np.ndarray) -> dict[str, float | int]:
     valid = np.isfinite(trajectory[:, 0]) & np.isfinite(gt[:, 0])
     if valid.sum() == 0:
@@ -619,6 +723,85 @@ def triangulate_run(
     write_csv(out_dir / "trajectory.csv", times, n_views, reproj, used, trajectory, smooth, gt)
     summary = {
         "run": run,
+        "reference_phone": ref["phone"],
+        "n_frames": int(n),
+        "cameras": {c["phone"]: c["label"] for c in cams},
+        "excluded_cameras": sorted(exclude),
+        "camera_configs": {c["phone"]: c["config"] for c in cams},
+        "camera_time_offsets_s": {c["phone"]: c["offset"] for c in cams},
+        "camera_sync_reproj_px": {c["phone"]: c["sync_med_px"] for c in cams},
+        "n_raw_triangulated": int(np.isfinite(trajectory[:, 0]).sum()),
+        "n_smooth_finite": int(np.isfinite(smooth[:, 0]).sum()),
+        "median_reproj_px": float(np.nanmedian(reproj)) if np.isfinite(reproj).any() else None,
+        "raw_metrics": raw_metrics,
+        "smooth_metrics": smooth_metrics,
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True))
+    return summary
+
+
+def triangulate_raw_run(
+    run: str,
+    calib: dict[tuple[str, str], CamCalib],
+    *,
+    raw_root: Path,
+    detections_root: Path,
+    out_root: Path,
+    max_reproj_px: float,
+) -> dict:
+    mocap = load_mocap_6d(mocap_path(raw_root, run))
+    exclude = EXCLUDE_CAMERAS.get(run, set())
+    cams = [build_raw_camera(run, phone, calib, mocap, raw_root, detections_root) for phone in PHONES if phone not in exclude]
+    if len(cams) < 2:
+        raise RuntimeError(f"{run}: fewer than 2 usable cameras")
+    ref = min(cams, key=lambda c: len(c["centroids"]))
+    n = len(ref["centroids"])
+    epoch_times = ref["aligned_start"] + np.arange(n) / ref["fps"]
+    times = epoch_times - mocap.header.wall_clock_start.timestamp()
+    trajectory = np.full((n, 3), np.nan, dtype=np.float64)
+    n_views = np.zeros(n, dtype=np.int32)
+    reproj = np.full(n, np.nan, dtype=np.float64)
+    used = np.full(n, "", dtype=object)
+
+    for i, epoch in enumerate(epoch_times):
+        obs: list[Observation] = []
+        for cam in cams:
+            xy = interpolate_centroid(cam["centroids"], epoch, start_epoch_s=cam["aligned_start"], fps=cam["fps"])
+            if xy is None:
+                continue
+            xy_u = undistort_pixel(cam["K"], cam["dist"], xy)
+            obs.append(Observation(cam["phone"], cam["P"], cam["R"], cam["tvec"], xy_u))
+        result = select_best_triangulation(obs, max_reproj_px=max_reproj_px)
+        if result is None:
+            continue
+        trajectory[i] = result.point
+        n_views[i] = result.n_views
+        reproj[i] = result.mean_reproj_px
+        used[i] = "+".join(result.cam_names)
+
+    smooth = ekf_smooth_trajectory(trajectory, sim_times=times, n_views=n_views, reproj_errors=reproj)
+    gt = nearest_gt(mocap, epoch_times)
+    raw_metrics = score_trajectory(trajectory, gt)
+    smooth_metrics = score_trajectory(smooth, gt)
+
+    out_dir = out_root / "mocap_raw" / run
+    out_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        out_dir / "trajectory.npz",
+        times_s=times,
+        mocap_times=times,
+        epoch_times_s=epoch_times,
+        trajectory_raw=trajectory,
+        trajectory_smooth=smooth,
+        gt_drone=gt,
+        n_views=n_views,
+        reproj_errors_px=reproj,
+        used_cameras=np.array([str(u) for u in used]),
+    )
+    write_csv(out_dir / "trajectory.csv", times, n_views, reproj, used, trajectory, smooth, gt)
+    summary = {
+        "run": f"mocap_raw/{run}",
+        "source": "raw mocap videos (no formatting)",
         "reference_phone": ref["phone"],
         "n_frames": int(n),
         "cameras": {c["phone"]: c["label"] for c in cams},
@@ -719,4 +902,50 @@ def run_triangulation(
             print(f"  {run}: FAILED: {exc}")
             summaries[run] = {"run": run, "error": str(exc)}
     (out_root / "summary.json").write_text(json.dumps(summaries, indent=2, sort_keys=True))
+    return summaries
+
+
+def run_raw_triangulation(
+    *,
+    raw_root: Path,
+    detections_root: Path,
+    out_root: Path,
+    runs: list[str] | None = None,
+    max_reproj_px: float = 30.0,
+    calibrate_only: bool = False,
+    calibration_json: Path | None = None,
+) -> dict[str, dict]:
+    out_root.mkdir(parents=True, exist_ok=True)
+    target_runs = runs or available_runs(raw_root) or RUNS
+    needed_configs = needed_calibration_configs(target_runs)
+    cal_path = calibration_json or out_root / "mocap_raw_calibration.json"
+    if cal_path.exists() and not calibrate_only:
+        calib = load_calibration(cal_path)
+    else:
+        calib = calibrate_raw(
+            raw_root=raw_root,
+            detections_root=detections_root,
+            needed_configs=needed_configs,
+        )
+        save_calibration(calib, cal_path)
+    if calibrate_only:
+        return {}
+
+    summaries: dict[str, dict] = {}
+    for run in target_runs:
+        try:
+            summaries[run] = triangulate_raw_run(
+                run,
+                calib,
+                raw_root=raw_root,
+                detections_root=detections_root,
+                out_root=out_root,
+                max_reproj_px=max_reproj_px,
+            )
+            print(f"  mocap_raw/{run}: {summaries[run]['n_raw_triangulated']} triangulated frames")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  mocap_raw/{run}: FAILED: {exc}")
+            summaries[run] = {"run": f"mocap_raw/{run}", "error": str(exc)}
+    (out_root / "mocap_raw").mkdir(parents=True, exist_ok=True)
+    (out_root / "mocap_raw" / "summary.json").write_text(json.dumps(summaries, indent=2, sort_keys=True))
     return summaries
